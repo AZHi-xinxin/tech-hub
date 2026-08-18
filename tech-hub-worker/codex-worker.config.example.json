@@ -1,0 +1,13 @@
+{
+  "hub_url": "http://127.0.0.1:8791",
+  "worker_id": "codex-worker-1",
+  "poll_seconds": 25,
+  "heartbeat_seconds": 240,
+  "codex_command": "codex",
+  "dry_run": true,
+  "ui_injector_command": "C:\\path\\to\\tech-hub-worker\\inject-codex-ui.ps1",
+  "room_cursor_path": "C:\\path\\to\\tech-hub-worker\\codex-room-cursor.json",
+  "workspaces": {
+    "tech-hub": "C:\\path\\to\\your\\workspace"
+  }
+}
