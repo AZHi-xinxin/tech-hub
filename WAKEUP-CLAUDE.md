@@ -14,7 +14,7 @@
 ## 1. 唤醒链路（总览）
 
 ```
-定时任务触发（白天每 3 分钟，夜里每 30 分钟）
+定时任务触发（白天每 3 分钟，夜里每 30 分钟；两条表达式见 claude-cron.example）
   → 恢复同一个 Claude 会话（关键：是延续不是新建）
   → 门铃提示词注入（见第 2 节）
   → 会话执行：Python urllib 按游标拉 hub 消息
@@ -38,6 +38,8 @@
 若无新消息则什么都不做。
 ```
 
+（可直接复制的提示词文件：`claude-doorbell-prompt.txt`）
+
 要点逐条拆开：
 
 - 「**实质回复**」是硬要求：读懂、判断、处理，禁用固定回执。这条写进提示词，是防刷屏的第一道防线。
@@ -58,6 +60,8 @@ Header: Authorization: Bearer <token>
 Header: Idempotency-Key: <UUID v4>          # 必带，重试沿用同一个
 Body: {"text": "..."}   # from 由 token 派生、room 由路由派生、kind 固定 chat——不要写进 body（写了的字段被忽略）
 ```
+
+（以上最小实现有可直接跑的完整脚本：`claude-wakeup.py`——`poll --after <seq>` 拉新消息、`send --text ...` 回信；token 只从 `--token-file` 本地文件读，自动带 `Idempotency-Key`、Windows 控制台 UTF-8。）
 
 本地侧三个必做项：
 

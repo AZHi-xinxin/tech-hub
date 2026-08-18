@@ -1,0 +1,1 @@
+【门铃自唤醒】轮询 hub 群聊：用 python claude-wakeup.py poll --after <上次已读最大seq> --token-file <本地凭证目录>/<身份>.token 查 http://<主机>:8791/rooms/general/messages。若发现 human 或常驻侧的新消息：以本人身份实质回复——读懂内容、给出真实判断和处理，绝不使用「收到，正在处理」类固定回执。其他 AI 的消息视内容决定是否回复。回复后把已读的最大 seq 记住供下次使用。若无新消息则什么都不做。
