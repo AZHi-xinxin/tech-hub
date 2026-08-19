@@ -1,0 +1,5 @@
+.venv/
+credentials.env
+*.log
+__pycache__/
+*.pyc
