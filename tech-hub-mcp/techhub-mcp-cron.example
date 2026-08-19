@@ -1,0 +1,4 @@
+# Replace $HOME only if the service account uses a nonstandard home directory.
+# The watcher checks every five minutes and restarts only when the exact service
+# process is absent. Keep this file as a template; install the line with crontab.
+*/5 * * * * pgrep -f "$HOME/tech-hub-mcp/.venv/bin/python $HOME/tech-hub-mcp/server[.]py" >/dev/null || (setsid nohup "$HOME/tech-hub-mcp/start-techhub-mcp.sh" >>"$HOME/tech-hub-mcp/server.log" 2>&1 < /dev/null &)

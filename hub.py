@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """tech-hub v0.1.1 — 多 AI 协作总线与任务账本
 
 部署: 任意常驻机器(家庭服务器/云主机), 端口默认 8791, SQLite(WAL) 持久化
@@ -14,16 +14,21 @@ import sqlite3
 import threading
 import time
 import uuid
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("TECH_HUB_DB", os.path.join(BASE_DIR, "techhub.db"))
 PORT = int(os.environ.get("TECH_HUB_PORT", "8791"))
+ATTACH_DIR = os.environ.get("TECH_HUB_ATTACH_DIR", os.path.join(BASE_DIR, "data", "attachments"))
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_FILE_BYTES = 30 * 1024 * 1024
+os.makedirs(ATTACH_DIR, exist_ok=True)
 VERSION = "0.1.1"
 
 LEASE_MIN = 10                      # 租约默认 10 分钟
@@ -105,6 +110,16 @@ CREATE TABLE IF NOT EXISTS sentinel(
 CREATE TABLE IF NOT EXISTS room_fold(
   room TEXT PRIMARY KEY, fold_after_seq INTEGER NOT NULL DEFAULT 0,
   summary TEXT, folded_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS room_folds(
+  room TEXT NOT NULL, fold_after_seq INTEGER NOT NULL,
+  summary TEXT NOT NULL DEFAULT '', folded_at TEXT NOT NULL DEFAULT '',
+  folded_by TEXT NOT NULL DEFAULT '', marker_seq INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(room, fold_after_seq));
+CREATE TABLE IF NOT EXISTS attachments(
+  id TEXT PRIMARY KEY, room TEXT NOT NULL, event_seq INTEGER NOT NULL DEFAULT 0,
+  filename TEXT NOT NULL, stored_name TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0,
+  content_type TEXT NOT NULL DEFAULT 'application/octet-stream', kind TEXT NOT NULL DEFAULT 'file',
+  uploader TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, identity TEXT,
   detail TEXT, created_at TEXT NOT NULL);
@@ -983,9 +998,9 @@ def rooms(request: Request):
 
 
 @app.get("/rooms/{room}/messages")
-def room_messages(request: Request, room: str, after: int = 0, limit: int = 50, wait_seconds: int = 0, ignore_fold: int = 0):
+def room_messages(request: Request, room: str, after: int = 0, limit: int = 50, wait_seconds: int = 0, ignore_fold: int = 0, until: int = 0):
     identity = get_identity(request)
-    if not (0 <= after <= 10 ** 12) or not (1 <= limit <= 100) or not (0 <= wait_seconds <= 30) or ignore_fold not in (0, 1):
+    if not (0 <= after <= 10 ** 12) or not (1 <= limit <= 100) or not (0 <= wait_seconds <= 30) or ignore_fold not in (0, 1) or not (0 <= until <= 10 ** 12) or (until > 0 and until < after):
         return err("bad_request", "invalid after/limit/wait_seconds/ignore_fold", 400)
     c = conn()
     exists = c.execute("SELECT 1 FROM rooms WHERE room=?", (room,)).fetchone()
@@ -995,14 +1010,18 @@ def room_messages(request: Request, room: str, after: int = 0, limit: int = 50, 
     frow = c.execute("SELECT fold_after_seq, summary, folded_at FROM room_fold WHERE room=?", (room,)).fetchone()
     fold = {"fold_after_seq": frow["fold_after_seq"], "summary": frow["summary"],
             "folded_at": frow["folded_at"]} if frow else None
-    # 客户端未显式指定起点(after=0)且未要求展开时, 默认从折叠锚点之后开始, 避免历史过长反复加载
-    if after == 0 and not ignore_fold and fold and fold["fold_after_seq"] > 0:
+    # 客户端未显式指定起点(after=0)且未要求展开、也非分段查看时, 默认从折叠锚点之后开始, 避免历史过长反复加载
+    if until == 0 and after == 0 and not ignore_fold and fold and fold["fold_after_seq"] > 0:
         after = fold["fold_after_seq"]
     deadline = time.monotonic() + wait_seconds
     events = []
     while True:
-        rows = c.execute("SELECT * FROM events WHERE room=? AND kind='chat' AND seq>? ORDER BY seq LIMIT ?",
-                         (room, after, limit)).fetchall()
+        if until:
+            rows = c.execute("SELECT * FROM events WHERE room=? AND kind='chat' AND seq>? AND seq<=? ORDER BY seq LIMIT ?",
+                             (room, after, until, limit)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM events WHERE room=? AND kind='chat' AND seq>? ORDER BY seq LIMIT ?",
+                             (room, after, limit)).fetchall()
         if rows:
             events = [event_api(r) for r in rows]
             break
@@ -1111,11 +1130,113 @@ def room_fold(request: Request, room: str, body: dict):
     ev = create_event(c, kind="chat", from_=identity, room=room,
                       payload={"text": "【折叠标记】%s 执行折叠: seq<=%d 的历史已折叠%s" % (
                           identity, last_chat, ("，摘要: " + summary.strip()) if summary.strip() else "")})
+    # 折叠历史: 每次折叠命令留一条, 供前端折叠卡片列表(可跳转分段)
+    c.execute("INSERT OR IGNORE INTO room_folds(room, fold_after_seq, summary, folded_at, folded_by, marker_seq) "
+              "VALUES(?,?,?,?,?,?)",
+              (room, last_chat, summary.strip(), utcnow(), identity, ev["seq"]))
     audit_event(c, "fold room=%s fold_after=%s by %s" % (room, last_chat, identity), identity)
     c.close()
     out = {"room": room, "fold_after_seq": last_chat, "summary": summary.strip(), "event": ev}
     idem_end(identity, "/rooms/%s/fold" % room, key, 200, out)
     return JSONResponse(status_code=200, content=out)
+
+
+@app.get("/rooms/{room}/folds")
+def room_folds(request: Request, room: str):
+    identity = get_identity(request)
+    if not ROOM_RE.match(room):
+        return err("bad_request", "invalid room name", 400)
+    c = conn()
+    c.execute("CREATE TABLE IF NOT EXISTS room_folds(room TEXT NOT NULL, fold_after_seq INTEGER NOT NULL, summary TEXT NOT NULL DEFAULT '', folded_at TEXT NOT NULL DEFAULT '', folded_by TEXT NOT NULL DEFAULT '', marker_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(room, fold_after_seq))")
+    # 懒迁移: 该房间尚无历史时, 从折叠标记事件重建(幂等), 兼容升级前的折叠记录
+    if c.execute("SELECT COUNT(*) n FROM room_folds WHERE room=?", (room,)).fetchone()["n"] == 0:
+        marker_re = re.compile(r"^【折叠标记】(\S+) 执行折叠: seq<=(\d+) 的历史已折叠(?:，摘要: (.*))?$")
+        for row in c.execute("SELECT seq, from_, payload, created_at FROM events WHERE room=? AND kind='chat'", (room,)).fetchall():
+            try:
+                text = json.loads(row["payload"] or "{}").get("text", "")
+            except Exception:
+                text = ""
+            m = marker_re.match(text or "")
+            if not m:
+                continue
+            who, after_seq, sum_text = m.group(1), int(m.group(2)), (m.group(3) or "").strip()
+            c.execute("INSERT OR IGNORE INTO room_folds(room, fold_after_seq, summary, folded_at, folded_by, marker_seq) "
+                      "VALUES(?,?,?,?,?,?)",
+                      (room, after_seq, sum_text, row["created_at"], who, row["seq"]))
+        frow = c.execute("SELECT fold_after_seq, summary, folded_at FROM room_fold WHERE room=?", (room,)).fetchone()
+        if frow and frow["fold_after_seq"] > 0:
+            c.execute("INSERT OR IGNORE INTO room_folds(room, fold_after_seq, summary, folded_at, folded_by, marker_seq) "
+                      "VALUES(?,?,?,?,?,?)",
+                      (room, frow["fold_after_seq"], frow["summary"] or "", frow["folded_at"], "", 0))
+        c.commit()
+    folds = [{"fold_after_seq": r["fold_after_seq"], "summary": r["summary"],
+              "folded_at": r["folded_at"], "folded_by": r["folded_by"], "marker_seq": r["marker_seq"]}
+             for r in c.execute("SELECT * FROM room_folds WHERE room=? ORDER BY fold_after_seq ASC", (room,)).fetchall()]
+    c.close()
+    current = folds[-1]["fold_after_seq"] if folds else 0
+    return {"folds": folds, "current": current}
+
+
+@app.post("/rooms/{room}/attachments")
+async def room_attachment(request: Request, room: str, filename: str = "", text: str = ""):
+    identity = get_identity(request)
+    check_csrf(request)
+    key, replay = idem_begin(request, identity, "/rooms/%s/attachments" % room)
+    if replay:
+        return replay
+    if not ROOM_RE.match(room):
+        return err("bad_request", "invalid room name", 400)
+    filename = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff()（） ]", "_", filename.strip())[:200] or "file"
+    if not size_ok(text, MAX_SIZES["chat"]):
+        return err("size_limit", "caption too long", 400)
+    data = await request.body()
+    if not data:
+        return err("bad_request", "empty body", 400)
+    ctype = request.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip().lower()
+    kind = "image" if ctype.startswith("image/") else "file"
+    limit = MAX_IMAGE_BYTES if kind == "image" else MAX_FILE_BYTES
+    if len(data) > limit:
+        return err("size_limit", "attachment exceeds %d bytes" % limit, 400)
+    aid = uuid.uuid4().hex
+    ext = re.sub(r"[^A-Za-z0-9.]", "", os.path.splitext(filename)[1])[:16]
+    stored = aid + ext
+    with open(os.path.join(ATTACH_DIR, stored), "wb") as f:
+        f.write(data)
+    c = conn()
+    if not c.execute("SELECT 1 FROM rooms WHERE room=?", (room,)).fetchone():
+        c.execute("INSERT OR IGNORE INTO rooms(room, description, created_at) VALUES(?, '', ?)", (room, utcnow()))
+    ev = create_event(c, kind="chat", from_=identity, room=room,
+                      payload={"text": text.strip() or filename,
+                               "attachment": {"id": aid, "filename": filename, "size": len(data),
+                                              "content_type": ctype, "kind": kind}})
+    c.execute("INSERT INTO attachments(id, room, event_seq, filename, stored_name, size, content_type, kind, uploader, created_at) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?)",
+              (aid, room, ev["seq"], filename, stored, len(data), ctype, kind, identity, utcnow()))
+    c.commit()
+    c.close()
+    out = {"seq": ev["seq"], "attachment": {"id": aid, "filename": filename, "size": len(data),
+                                            "content_type": ctype, "kind": kind}}
+    idem_end(identity, "/rooms/%s/attachments" % room, key, 200, out)
+    return JSONResponse(status_code=200, content=out)
+
+
+@app.get("/attachments/{aid}")
+def get_attachment(request: Request, aid: str, download: int = 0):
+    identity = get_identity(request)
+    if not re.fullmatch(r"[0-9a-f]{32}", aid):
+        return err("bad_request", "invalid attachment id", 400)
+    c = conn()
+    row = c.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
+    c.close()
+    if not row:
+        return err("not_found", "no such attachment", 404)
+    path = os.path.join(ATTACH_DIR, row["stored_name"])
+    if not os.path.exists(path):
+        return err("not_found", "attachment file missing", 404)
+    disp = "attachment" if download else ("inline" if row["kind"] == "image" else "attachment")
+    headers = {"Content-Disposition": "%s; filename*=UTF-8''%s" % (disp, quote(row["filename"])),
+               "X-Content-Type-Options": "nosniff"}
+    return FileResponse(path, media_type=row["content_type"] or "application/octet-stream", headers=headers)
 
 
 # ---------------- 门铃哨兵 ----------------
@@ -1403,6 +1524,7 @@ UI_HTML = """<!DOCTYPE html>
  .sender-other .avatar{background:#64748b}
  .row{display:flex;gap:8px;margin-top:10px}
  input[type=text],input[type=password],textarea{flex:1;padding:9px 11px;border:1px solid #ccd0d5;border-radius:8px;font-size:14px;font-family:inherit}
+ #inbox{flex:1;box-sizing:border-box;resize:none;min-height:38px;max-height:40vh;overflow-y:auto;line-height:1.5}
  button.act{background:#1a66cc;color:#fff;border:none;border-radius:8px;padding:9px 16px;font-size:14px;cursor:pointer}
  button.act.gray{background:#6b7280}
  button.ok{background:#16a34a} button.no{background:#dc2626}
@@ -1454,13 +1576,18 @@ UI_HTML = """<!DOCTYPE html>
    <b>房间</b>
    <select id="roomsel" onchange="loadMsgs(true)"></select>
    <button class="act gray" style="padding:3px 10px;font-size:12px" onclick="jumpBottom()">↓ 回到最新</button>
-   <div id="foldbar" style="display:none;background:#fff7ed;border:1px solid #fdba74;border-radius:8px;padding:6px 10px;margin-top:8px;font-size:13px">
-    📁 <span class="fold-sum"></span>
-    <button class="act gray" style="padding:3px 10px;font-size:12px;margin-left:8px" onclick="expandAll()">展开全部</button>
+   <div id="foldbar" style="display:none;margin-top:8px;font-size:12px">
+    <div id="foldcards"></div>
+   </div>
+   <div id="segbar" style="display:none;background:#eef2ff;border:1px solid #a5b4fc;border-radius:8px;padding:4px 10px;margin-top:8px;font-size:12px;color:#3730a3">
+    <span id="segtext"></span>
+    <button class="act gray" style="padding:2px 8px;font-size:12px;margin-left:8px" onclick="backToLatest()">返回最新</button>
    </div>
    <div id="msgs" aria-live="polite" aria-label="群聊消息"></div>
    <div class="row">
-    <input type="text" id="inbox" placeholder="发消息…">
+    <textarea id="inbox" rows="1" placeholder="发消息…"></textarea>
+    <button class="act gray" id="attachbtn" style="padding:6px 12px;font-size:14px" title="发送图片/文件">📎</button>
+    <input type="file" id="filein" style="display:none">
     <button class="act" onclick="sendMsg()">发送</button>
     <span id="senderr" style="color:#c0392b;font-size:13px"></span>
    </div>
@@ -1528,9 +1655,9 @@ const cnDateTime = new Intl.DateTimeFormat('zh-CN', {
 });
 function tlocal(s){ const d=parseHubTime(s); return d ? cnTime.format(d) : (s||''); }
 function tcn(s){ const d=parseHubTime(s); return d ? cnDateTime.format(d).replaceAll('/','-') : (s||''); }
-let room='general', cur=0, ignoreFold=false, loading=false;
+let room='general', cur=0, loading=false, foldsList=[], foldsExpanded=false, viewSeg=null;
 async function boot(){
-  try { await j('GET','/ui/tasks'); showMain(); loadRooms(); loadMsgs(true); setInterval(()=>{ loadMsgs(false).catch(()=>{}); loadTasks().catch(()=>{}); loadAps().catch(()=>{}); }, 4000); }
+  try { await j('GET','/ui/tasks'); showMain(); loadRooms(); loadFolds(); loadMsgs(true); setInterval(()=>{ loadMsgs(false).catch(()=>{}); loadTasks().catch(()=>{}); loadAps().catch(()=>{}); }, 4000); }
   catch(e){ showLogin(); }
 }
 async function loadRooms(){
@@ -1549,27 +1676,23 @@ async function loadMsgs(reset){
   let rounds = 0;
   while (true){
     let q = '/rooms/'+room+'/messages?after='+cur+'&limit=50';
-    if (rounds === 0 && cur === 0 && ignoreFold) q += '&ignore_fold=1';
+    if (viewSeg) q += '&until='+viewSeg.until;
     const d = await j('GET', q);
     if (rounds === 0 && cur === 0){
-      if (!ignoreFold && d.fold && d.fold.fold_after_seq > 0){
+      if (!viewSeg && d.fold && d.fold.fold_after_seq > 0){
         cur = d.fold.fold_after_seq;
-        const fb = document.getElementById('foldbar');
-        fb.style.display = '';
-        fb.querySelector('.fold-sum').textContent = (d.fold.summary || '无摘要') + ' （seq≤' + d.fold.fold_after_seq + ' 已折叠）';
-      } else {
-        document.getElementById('foldbar').style.display = 'none';
       }
     }
     // 相邻同 from 同 text 的事件折叠为一条(多收件人扇出/客户端重发), @徽标合并收件人
     const groups = [];
     for (const e of d.events){
       const p = e.payload || {};
+      const att = p.attachment || null;
       const g = groups[groups.length-1];
-      if (g && g.from === e.from && g.text === (p.text||'')){
+      if (g && !att && !g.att && g.from === e.from && g.text === (p.text||'')){
         if (e.to) g.tos.push(e.to); g.seq = e.seq; g.at = e.created_at;
       } else {
-        groups.push({from:e.from, text:p.text||'', tos:e.to?[e.to]:[], seq:e.seq, at:e.created_at});
+        groups.push({from:e.from, text:p.text||'', tos:e.to?[e.to]:[], seq:e.seq, at:e.created_at, att:att});
       }
     }
     for (const g of groups){
@@ -1578,26 +1701,97 @@ async function loadMsgs(reset){
       const div = document.createElement('div'); div.className='msg sender-'+senderClass(g.from);
       div.dataset.from = g.from || 'unknown';
       const targets = g.tos.map(t=>'<span class="at">@'+esc(person(t).label)+'</span>').join('');
+      const attBox = g.att ? '<div style="margin-top:6px">'+attHtml(g.att)+'</div>' : '';
       div.innerHTML = '<div class="avatar" title="'+esc(identity.label)+'">'+esc(identity.avatar)+'</div>'+
         '<div class="msg-stack"><div class="msg-meta"><span class="who">'+esc(identity.label)+'</span>'+targets+
-        '<span class="time">'+tlocal(g.at)+'</span></div><div class="bubble">'+esc(g.text)+'</div></div>';
+        '<span class="time">'+tlocal(g.at)+'</span></div><div class="bubble">'+esc(g.text)+attBox+'</div></div>';
       box.appendChild(div);
     }
     if (!reset || d.events.length < 50 || ++rounds > 20) break;
   }
   if (reset || nearBottom) box.scrollTop = box.scrollHeight;
+  const sb = document.getElementById('segbar');
+  const st = document.getElementById('segtext');
+  if (viewSeg){
+    sb.style.display = '';
+    st.textContent = '正在查看折叠段 seq' + (viewSeg.after+1) + '–' + viewSeg.until + '：' + (viewSeg.label || '该段历史');
+  } else {
+    sb.style.display = 'none';
+  }
   } finally { loading = false; }
 }
-async function expandAll(){
-  ignoreFold = true;
-  try { await loadMsgs(true); } catch(e){}
-  ignoreFold = false;
-  document.getElementById('foldbar').style.display = 'none';
+async function loadFolds(){
+  try {
+    const d = await j('GET','/rooms/'+room+'/folds');
+    foldsList = d.folds || [];
+    renderFolds();
+  } catch(e){}
 }
-function jumpBottom(){
-  ignoreFold = false;
+function foldCardHtml(f, idx){
+  const s = f.summary || '无摘要';
+  const short = s.length > 30 ? s.slice(0,30) + '…' : s;
+  return '<div class="foldcard" style="display:flex;align-items:center;gap:6px;padding:4px 10px;margin-top:4px;background:#fff7ed;border:1px solid #fdba74;border-radius:8px;cursor:pointer;font-size:12px;color:#7c2d12" onclick="openFold(' + idx + ')">' +
+    '<span>📁</span><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px">' + esc(short) + '</span>' +
+    '<span style="margin-left:auto;white-space:nowrap;color:#9a3412;opacity:.75">seq≤' + f.fold_after_seq + ' · ' + tcn(f.folded_at) + '</span></div>';
+}
+function renderFolds(){
+  const fb = document.getElementById('foldbar');
+  const box = document.getElementById('foldcards');
+  if (!foldsList.length){ fb.style.display='none'; box.innerHTML=''; return; }
+  fb.style.display = '';
+  let html = '';
+  if (foldsExpanded || foldsList.length <= 2){
+    for (let i=0;i<foldsList.length;i++) html += foldCardHtml(foldsList[i], i);
+  } else {
+    html = foldCardHtml(foldsList[0], 0);
+    const hidden = foldsList.length - 1;
+    html += '<div class="foldcard" style="display:flex;align-items:center;justify-content:center;gap:6px;padding:4px 10px;margin-top:4px;background:#fef3c7;border:1px dashed #f59e0b;border-radius:8px;cursor:pointer;font-size:12px;color:#92400e" onclick="event.stopPropagation();foldsExpanded=true;renderFolds()">📚 还有 ' + hidden + ' 段已折叠 · 展开列表 ▾</div>';
+  }
+  if (foldsExpanded && foldsList.length > 2){
+    html += '<div class="foldcard" style="display:flex;align-items:center;justify-content:center;gap:6px;padding:4px 10px;margin-top:4px;background:#fef3c7;border:1px dashed #f59e0b;border-radius:8px;cursor:pointer;font-size:12px;color:#92400e" onclick="event.stopPropagation();foldsExpanded=false;renderFolds()">▲ 收起列表</div>';
+  }
+  box.innerHTML = html;
+}
+async function openFold(idx){
+  const f = foldsList[idx];
+  if (!f) return;
+  const prev = idx > 0 ? foldsList[idx-1].fold_after_seq : 0;
+  viewSeg = {after: prev, until: f.fold_after_seq, label: f.summary || ''};
+  await loadMsgs(true);
+}
+function backToLatest(){
+  viewSeg = null;
   loadMsgs(true);
 }
+function jumpBottom(){
+  backToLatest();
+}
+function attHtml(a){
+  const url = '/attachments/'+a.id;
+  if (a.kind === 'image'){
+    return '<a href="'+url+'" target="_blank"><img src="'+url+'" alt="'+esc(a.filename)+'" style="max-width:240px;max-height:240px;border-radius:8px;display:block"></a>';
+  }
+  const kb = a.size > 1024 ? Math.round(a.size/1024) + ' KB' : a.size + ' B';
+  return '<a href="'+url+'?download=1" style="display:inline-flex;gap:8px;align-items:center;padding:6px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:8px;text-decoration:none;color:#1e293b;font-size:13px">📄 '+esc(a.filename)+' <span style="color:#94a3b8">'+kb+'</span></a>';
+}
+async function sendFile(f){
+  const err = document.getElementById('senderr');
+  err.textContent = '';
+  const text = document.getElementById('inbox').value.trim();
+  if (f.size > 30*1024*1024){ err.textContent = '文件超过 30MB 上限'; return; }
+  if (f.type && f.type.startsWith('image/') && f.size > 10*1024*1024){ err.textContent = '图片超过 10MB 上限'; return; }
+  try {
+    const q = '/rooms/'+room+'/attachments?filename='+encodeURIComponent(f.name)+'&text='+encodeURIComponent(text.slice(0,2000));
+    const r = await fetch(q, {method:'POST', headers:{'X-Requested-With':'XMLHttpRequest','Idempotency-Key':uid()}, credentials:'same-origin', body:f});
+    if (r.status === 401){ showLogin(); throw new Error('401'); }
+    const data = await r.json().catch(()=>null);
+    if (!r.ok) throw new Error((data && data.message) || r.status);
+    document.getElementById('inbox').value='';
+    loadMsgs(false);
+  } catch(e){ err.textContent = '发送失败: ' + (e.message || e); }
+}
+document.getElementById('attachbtn').onclick = ()=> document.getElementById('filein').click();
+document.getElementById('filein').addEventListener('change', (e)=>{ const f = e.target.files[0]; e.target.value=''; if (f) sendFile(f); });
 async function sendMsg(){
   const t = document.getElementById('inbox').value.trim();
   if (!t) return;
@@ -1606,7 +1800,11 @@ async function sendMsg(){
   try {
     await j('POST','/rooms/'+room+'/messages',{text:t});
     document.getElementById('inbox').value='';
-    loadMsgs(true);
+    fitInbox();
+    // Append the newly sent event instead of rebuilding the whole timeline.
+    await loadMsgs(false);
+    const box = document.getElementById('msgs');
+    box.scrollTop = box.scrollHeight;
   } catch(e) {
     err.textContent = '发送失败: ' + (e.message || e);
   }
@@ -1643,8 +1841,20 @@ function sw(t){
   document.getElementById('pane-ap').classList.toggle('hidden', t!=='ap');
   for (const x of ['chat','task','ap']) document.getElementById('tab-'+x).classList.toggle('on', t===x);
 }
-document.getElementById('roomsel').onchange = ()=>{ room = document.getElementById('roomsel').value; loadMsgs(true); };
-document.getElementById('inbox').addEventListener('keydown', e=>{ if(e.key==='Enter') sendMsg(); });
+document.getElementById('roomsel').onchange = ()=>{ room = document.getElementById('roomsel').value; loadFolds(); loadMsgs(true); };
+document.getElementById('inbox').addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendMsg(); } });
+// Auto-fit the human input, WeChat style: width is always the full row;
+// only the height grows with the line count, up to half the chat card,
+// then the box scrolls internally while editing.
+const inboxEl=document.getElementById('inbox');
+function fitInbox(){
+  const card=document.getElementById('msgs').parentElement;
+  const maxH=Math.max(120, card.clientHeight*0.5);
+  inboxEl.style.height='auto';
+  inboxEl.style.height=Math.min(Math.max(38, inboxEl.scrollHeight), maxH)+'px';
+}
+inboxEl.addEventListener('input', fitInbox);
+window.addEventListener('resize', fitInbox);
 boot();
 </script>
 </body>
