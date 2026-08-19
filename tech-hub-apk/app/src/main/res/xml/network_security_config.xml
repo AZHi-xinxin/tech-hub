@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- tech-hub commonly runs on a private LAN or Tailscale HTTP address. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
+

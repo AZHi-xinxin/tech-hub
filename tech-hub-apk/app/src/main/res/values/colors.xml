@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ink">#17253B</color>
+    <color name="muted">#6F7B8E</color>
+    <color name="surface">#F5F7FB</color>
+    <color name="toolbar">#FFFDF8</color>
+    <color name="accent">#2F6FDB</color>
+    <color name="address_active_bg">#E5F0FF</color>
+    <color name="address_active_stroke">#78A9F2</color>
+    <color name="address_mode_bg">#F4F8FF</color>
+    <color name="address_mode_stroke">#B8C9E7</color>
+    <color name="address_pressed_bg">#DCE9FA</color>
+    <color name="address_disabled_text">#B9C0CC</color>
+    <color name="ic_launcher_background">#FFF4DC</color>
+</resources>
+

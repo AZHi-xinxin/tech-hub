@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
-"""tech-hub v0.1.1 — 多 AI 协作总线与任务账本
+#!/usr/bin/env python3
+"""tech-hub v0.1.1 — 多 AI 协作总线与任务账本（契约冻结版实现）
 
-部署: 任意常驻机器(家庭服务器/云主机), 端口默认 8791, SQLite(WAL) 持久化
-运行: cron 看门狗 source credentials.env 后 python3 hub.py(见 README.md)
-凭证: 环境变量 <IDENTITY>_TOKEN 形式(如 HUMAN_TOKEN), 只存 credentials.env(600),
-      日志/事件不落 Authorization 头与明文凭证。
+部署: 任意常驻机器, 端口由 TECH_HUB_PORT 指定(默认 8791), SQLite(WAL) 持久化
+运行: cron 看门狗 source credentials.env 后启动 hub.py
+凭证: 环境变量 HUMAN_TOKEN/CLAUDE_TOKEN/CODEX_TOKEN/DSH_TOKEN/RIKKA_TOKEN,
+      只存 credentials.env(600), 日志/事件不落 Authorization 头与明文凭证。
 """
 import json
 import os
@@ -35,13 +35,11 @@ LEASE_MIN = 10                      # 租约默认 10 分钟
 APPROVAL_WINDOW_MIN = 30            # 审批一次批准 30 分钟有效
 IDEM_TTL_H = 24                     # 幂等键 24 小时
 SWEEP_INTERVAL_S = 30               # 后台清扫周期
-IDENTITIES = tuple(i.strip() for i in os.environ.get(
-    "TECH_HUB_IDENTITIES", "human,claude,codex,dsh,rikka").split(",") if i.strip())
-WORKER_IDENTITIES = tuple(i.strip() for i in os.environ.get(
-    "TECH_HUB_WORKER_IDENTITIES", "claude,codex,dsh").split(",") if i.strip())
-WORKERS = {"%s-worker-1" % i: i for i in WORKER_IDENTITIES}
-SYSTEM_IDENTITY = os.environ.get("TECH_HUB_SYSTEM_IDENTITY", "claude").strip()
-SENTINEL_STOP_PHRASE = os.environ.get("TECH_HUB_STOP_PHRASE", "本次任务已结束")
+IDENTITIES = tuple(x.strip() for x in (os.environ.get("TECH_HUB_IDENTITIES") or "human,claude,codex,dsh,rikka").split(","))
+WORKER_IDENTITIES = tuple(x.strip() for x in (os.environ.get("TECH_HUB_WORKER_IDENTITIES") or "claude,codex,dsh").split(","))
+WORKERS = {"codex-worker-1": "codex", "dsh-worker-1": "dsh", "claude-worker-1": "claude"}
+SYSTEM_IDENTITY = os.environ.get("TECH_HUB_SYSTEM_IDENTITY", "claude")
+STOP_PHRASE = os.environ.get("TECH_HUB_STOP_PHRASE", "本次任务已结束")
 TERMINAL = {"completed", "failed", "cancelled"}
 TRANSITIONS = {
     "queued": {"running", "cancelled"},
@@ -1261,7 +1259,7 @@ def sentinel_poll(request: Request, body: dict):
         (room, cur)).fetchall()
     meeting_end = False
     for r in rows:
-        if r["from_"] == "human" and (json.loads(r["payload"] or "{}").get("text") or "").strip() == SENTINEL_STOP_PHRASE:
+        if r["from_"] == "human" and (json.loads(r["payload"] or "{}").get("text") or "").strip() == STOP_PHRASE:
             paused = True
             meeting_end = True
         else:
@@ -1385,21 +1383,63 @@ def ui_logout(request: Request):
     return resp
 
 
+_UI_ACTIVE_STATUSES = ("queued", "running", "waiting_input", "waiting_approval", "needs_human", "failed")
+
+
+def last_step_text(c, task_id) -> str:
+    """任务卡「当前步骤」: 取该任务最新一条事件的可读文本"""
+    row = c.execute("SELECT kind, payload FROM events WHERE task_id=? ORDER BY seq DESC LIMIT 1",
+                    (task_id,)).fetchone()
+    if not row:
+        return ""
+    p = json.loads(row["payload"] or "{}")
+    kind = row["kind"]
+    if kind == "log":
+        return str(p.get("text", ""))
+    if kind == "result":
+        s = str(p.get("result_summary", ""))
+        return ("[%s] %s" % (p.get("status", ""), s)).strip() if s else ""
+    if kind == "system":
+        return str(p.get("text", ""))
+    if kind == "control":
+        return "control %s" % str(p.get("action", ""))
+    if kind == "approval_request":
+        return "待审批: %s" % str(p.get("op_summary", ""))
+    return ""
+
+
 @app.get("/ui/tasks")
 def ui_tasks(request: Request, limit: int = 50):
     identity = get_identity(request)
     if identity != "human":
         return err("forbidden", "human only", 403)
     c = conn()
-    rows = c.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (min(limit, 200),)).fetchall()
-    out = []
-    for t in rows:
+    lim = min(limit, 200)
+    rows = c.execute(
+        "SELECT * FROM tasks WHERE type!='query' AND status IN (%s) "
+        "ORDER BY updated_at DESC LIMIT ?" % ",".join("?" * len(_UI_ACTIVE_STATUSES)),
+        (*_UI_ACTIVE_STATUSES, lim)).fetchall()
+    hrows = c.execute(
+        "SELECT * FROM tasks WHERE type!='query' AND status IN ('completed','cancelled') AND updated_at >= ? "
+        "ORDER BY updated_at DESC LIMIT ?",
+        ((datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(timespec="milliseconds"),
+         min(lim, 30))).fetchall()
+    sys_total = c.execute("SELECT COUNT(*) AS n FROM tasks WHERE type='query'").fetchone()["n"]
+    sys_active = c.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE type='query' AND status NOT IN ('completed','cancelled')"
+    ).fetchone()["n"]
+
+    def decorate(t):
         cnt = c.execute("SELECT COUNT(*) AS n FROM events WHERE task_id=?", (t["task_id"],)).fetchone()["n"]
         d = task_api(t)
         d["events_count"] = cnt
-        out.append(d)
+        d["last_step"] = last_step_text(c, t["task_id"])
+        return d
+
+    out = [decorate(t) for t in rows]
+    hist = [decorate(t) for t in hrows]
     c.close()
-    return {"tasks": out}
+    return {"tasks": out, "history": hist, "sys_total": sys_total, "sys_active": sys_active}
 
 
 @app.get("/ui/approvals")
@@ -1409,7 +1449,8 @@ def ui_approvals(request: Request):
         return err("forbidden", "human only", 403)
     c = conn()
     rows = c.execute(
-        "SELECT a.event_id, a.task_id, a.expires_at, a.decision, t.status AS task_status, e.payload "
+        "SELECT a.event_id, a.task_id, a.expires_at, a.decision, t.status AS task_status, "
+        "t.from_ AS from_identity, e.payload "
         "FROM approvals a JOIN tasks t ON t.task_id=a.task_id JOIN events e ON e.event_id=a.event_id "
         "WHERE a.decision IS NULL ORDER BY a.expires_at").fetchall()
     out = []
@@ -1417,7 +1458,8 @@ def ui_approvals(request: Request):
         p = json.loads(r["payload"] or "{}")
         out.append({
             "event_id": r["event_id"], "task_id": r["task_id"], "expires_at": r["expires_at"],
-            "task_status": r["task_status"], "op_summary": p.get("op_summary", ""),
+            "task_status": r["task_status"], "from": r["from_identity"],
+            "op_summary": p.get("op_summary", ""),
             "op_scope": p.get("op_scope", []), "risk_level": p.get("risk_level"),
         })
     c.close()
@@ -1550,15 +1592,34 @@ UI_HTML = """<!DOCTYPE html>
   .row{gap:6px}
   button.act{padding:9px 12px}
  }
+ .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#dc2626;margin-left:6px;vertical-align:2px}
+.dot.hidden{display:none}
+ .pendbar{background:#fff1f0;border:1px solid #ffb3ad;border-radius:10px;padding:10px 12px;margin-bottom:10px;color:#7c1610}
+ .pendbar .ptitle{font-weight:700;margin-bottom:4px}
+ .pendbar .aprow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:6px 0;border-top:1px dashed #ffd0cc;font-size:13px}
+ .sechead{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;padding:2px 0}
+ .sechead.foldable{cursor:pointer;user-select:none}
+ .tcard{border:1px solid #e5e9f0;border-radius:9px;padding:9px 11px;margin-top:8px;background:#fcfdfe}
+ .tgoal{font-weight:600;font-size:13.5px;margin-bottom:3px;overflow-wrap:anywhere}
+ .tmeta{font-size:12px;color:#6b7280;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+ .tstep{font-size:12.5px;color:#334155;margin-top:5px;overflow-wrap:anywhere}
+ .tstep .lb{color:#94a3b8}
+ .tresult{font-size:12.5px;margin-top:3px;overflow-wrap:anywhere}
+ .tresult.ok{color:#15803d}.tresult.bad{color:#b91c1c}
+ .needbadge{background:#dc2626;color:#fff;border-radius:999px;font-size:12px;padding:0 8px;line-height:19px}
+ .muted{color:#94a3b8;font-size:12.5px;padding:8px 0}
+ .alink{color:#1a66cc;cursor:pointer;text-decoration:underline}
+ .apscope{font-size:12px;color:#9a3412}
+ .apdeadline{font-size:12px;color:#7c1610;font-weight:600}
+ .aprow{border-top:1px dashed #ffd0cc;padding:6px 0}
 </style>
 </head>
 <body>
 <header id="topbar" class="hidden">
  <h1>tech-hub</h1>
  <div class="tabs">
-  <button id="tab-chat" class="on">群聊</button>
-  <button id="tab-task">任务</button>
-  <button id="tab-ap">审批</button>
+  <button id="tab-chat" class="on">群聊<span id="chatdot" class="dot hidden"></span></button>
+  <button id="tab-prog">进度<span id="progdot" class="dot hidden"></span></button>
  </div>
  <span style="flex:1"></span>
  <button class="act gray" onclick="doLogout()">退出</button>
@@ -1583,6 +1644,7 @@ UI_HTML = """<!DOCTYPE html>
     <span id="segtext"></span>
     <button class="act gray" style="padding:2px 8px;font-size:12px;margin-left:8px" onclick="backToLatest()">返回最新</button>
    </div>
+   <div id="pendbar" class="pendbar hidden"></div>
    <div id="msgs" aria-live="polite" aria-label="群聊消息"></div>
    <div class="row">
     <textarea id="inbox" rows="1" placeholder="发消息…"></textarea>
@@ -1593,11 +1655,27 @@ UI_HTML = """<!DOCTYPE html>
    </div>
   </div>
  </div>
- <div id="pane-task" class="hidden">
-  <div class="card"><table id="tasklist"><thead><tr><th>任务</th><th>状态</th><th>来自</th><th>请求</th><th>更新</th></tr></thead><tbody></tbody></table></div>
- </div>
- <div id="pane-ap" class="hidden">
-  <div class="card" id="aplist">暂无待审批项</div>
+ <div id="pane-prog" class="hidden">
+  <div class="card hidden" id="needsec">
+   <div class="sechead"><span>🟥 需要你处理</span><span class="needbadge" id="needcount"></span></div>
+   <div id="needlist"></div>
+  </div>
+  <div class="card" id="progsec">
+   <div class="sechead"><span>🟦 进行中</span></div>
+   <div id="proglist"></div>
+  </div>
+  <div class="card hidden" id="blocksec">
+   <div class="sechead"><span>🟨 阻塞 · 失败</span></div>
+   <div id="blocklist"></div>
+  </div>
+  <div class="card" id="histsec">
+   <div class="sechead foldable" onclick="toggleHist()"><span>📦 历史</span><span class="pill" id="histcount"></span><span id="histarrow">▸</span></div>
+   <div id="histlist" class="hidden"></div>
+  </div>
+  <div class="card" id="syssec">
+   <div class="sechead foldable" onclick="toggleSys()"><span>🗂 系统记录（门铃自动任务）</span><span class="pill" id="syscount"></span><span id="sysarrow">▸</span></div>
+   <div id="syslist" class="hidden"><div class="muted">门铃轮询产生的 query 型任务在后台静默运行，不进进度视图。</div></div>
+  </div>
  </div>
 </main>
 <script>
@@ -1631,7 +1709,7 @@ function esc(s){ const d=document.createElement('div'); d.textContent=s==null?''
 const PEOPLE = {
   human:{label:'Human', avatar:'H'},
   rikka:{label:'Rikka', avatar:'R'},
-  claude:{label:'Claude', avatar:'C'},
+  claude:{label:'VS Claude', avatar:'C'},
   codex:{label:'Codex', avatar:'G'},
   dsh:{label:'DSH', avatar:'D'}
 };
@@ -1707,9 +1785,19 @@ async function loadMsgs(reset){
         '<span class="time">'+tlocal(g.at)+'</span></div><div class="bubble">'+esc(g.text)+attBox+'</div></div>';
       box.appendChild(div);
     }
+    if (!viewSeg && groups.length) latestFrom = groups[groups.length-1].from;
     if (!reset || d.events.length < 50 || ++rounds > 20) break;
   }
-  if (reset || nearBottom) box.scrollTop = box.scrollHeight;
+  if (reset){
+    // 首次加载/切换地址: 立即 + requestAnimationFrame + 短延时 三次滚底, 等布局稳定后落位
+    const snap = ()=> box.scrollTop = box.scrollHeight;
+    snap();
+    requestAnimationFrame(snap);
+    setTimeout(snap, 120);
+  } else if (nearBottom) {
+    // 4 秒轮询只保留 nearBottom 条件, 翻历史时绝不拽回底部
+    box.scrollTop = box.scrollHeight;
+  }
   const sb = document.getElementById('segbar');
   const st = document.getElementById('segtext');
   if (viewSeg){
@@ -1718,6 +1806,7 @@ async function loadMsgs(reset){
   } else {
     sb.style.display = 'none';
   }
+  if (!viewSeg) updateChatDot();
   } finally { loading = false; }
 }
 async function loadFolds(){
@@ -1801,7 +1890,8 @@ async function sendMsg(){
     await j('POST','/rooms/'+room+'/messages',{text:t});
     document.getElementById('inbox').value='';
     fitInbox();
-    // Append the newly sent event instead of rebuilding the whole timeline.
+    // Sending adds exactly one new event. Append it instead of rebuilding the
+    // whole timeline, otherwise the browser visibly paints from top to bottom.
     await loadMsgs(false);
     const box = document.getElementById('msgs');
     box.scrollTop = box.scrollHeight;
@@ -1809,37 +1899,113 @@ async function sendMsg(){
     err.textContent = '发送失败: ' + (e.message || e);
   }
 }
+const WORKERMAP = {'codex-worker-1':'codex','dsh-worker-1':'dsh','claude-worker-1':'claude'};
+const STATUS_ZH = {queued:'排队中',running:'进行中',waiting_input:'等待输入',waiting_approval:'等待审批',needs_human:'需要你',failed:'失败',completed:'完成',cancelled:'已取消'};
+let apList = [], needTaskCount = 0, latestFrom = null, pane='chat', progDirty=false, taskFp=null, apFp0=null;
+function remainMin(s){ const d=parseHubTime(s); if(!d) return ''; const m=Math.round((d-Date.now())/60000); return m<=0 ? '已截止' : ('剩 '+m+' 分钟'); }
+function statusPill(t){ return '<span class="pill '+esc(t.status)+'">'+esc(STATUS_ZH[t.status]||t.status)+'</span>'; }
+function taskCard(t){
+  const doer = t.claimed_by ? person(WORKERMAP[t.claimed_by]||t.claimed_by).label : '—';
+  let html = '<div class="tcard">';
+  html += '<div class="tgoal">'+esc((t.request||'').slice(0,80))+((t.request||'').length>80?'…':'')+'</div>';
+  html += '<div class="tmeta"><span>#'+esc(t.task_id).slice(0,8)+'</span><span>来自 '+esc(person(t.from).label)+'</span><span>在做 '+esc(doer)+'</span>'+statusPill(t)+'<span>更新 '+esc(tcn(t.updated_at))+'</span></div>';
+  if (t.last_step) html += '<div class="tstep"><span class="lb">步骤 </span>'+esc((t.last_step||'').slice(0,120))+((t.last_step||'').length>120?'…':'')+'</div>';
+  if (t.result_summary) html += '<div class="tresult '+(t.status==='completed'?'ok':(t.status==='failed'?'bad':''))+'">'+(t.status==='completed'?'结果 ':(t.status==='failed'?'原因 ':'说明 '))+esc((t.result_summary||'').slice(0,120))+'</div>';
+  if (t.status==='queued' || t.status==='needs_human'){
+    html += '<div style="margin-top:6px">' +
+      '<button style="padding:4px 12px;font-size:12px;border:1px solid #e2e8f0;border-radius:6px;background:#fff;color:#64748b;cursor:pointer" data-tid="'+esc(t.task_id)+'" data-act="cancel">取消</button>';
+    if (t.status==='needs_human'){
+      html += '<button style="padding:4px 12px;font-size:12px;margin-left:8px;border:1px solid #16a34a;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer" data-tid="'+esc(t.task_id)+'" data-act="continue">继续</button>';
+    }
+    html += '</div>';
+  }
+  return html + '</div>';
+}
+function bindTaskButtons(root){
+  root.querySelectorAll('button[data-act]').forEach(b=>{
+    b.onclick = ()=> j('POST','/task/'+b.dataset.tid+'/control',{action:b.dataset.act}).then(()=>{ loadTasks().catch(()=>{}); }).catch(()=>{ loadTasks().catch(()=>{}); });
+  });
+}
+function apCard(a){
+  const scope = (a.op_scope||[]).length ? esc((a.op_scope||[]).join('、')) : '未注明';
+  return '<div class="aprow">' +
+    '<span style="flex:1;min-width:180px"><b>'+esc(a.op_summary)+'</b>' +
+    '<div class="apscope">申请: '+esc(person(a.from).label)+' · 影响: '+scope+'</div>' +
+    '<div class="apdeadline">⏰ 截止 '+esc(tcn(a.expires_at))+' · '+esc(remainMin(a.expires_at))+'</div></span>' +
+    '<button class="act ok" data-eid="'+esc(a.event_id)+'" data-tid="'+esc(a.task_id)+'" data-d="approve">批准一次</button>' +
+    '<button class="act no" data-eid="'+esc(a.event_id)+'" data-tid="'+esc(a.task_id)+'" data-d="reject">拒绝</button></div>';
+}
+function bindApButtons(root){
+  root.querySelectorAll('button[data-eid]').forEach(b=>{
+    b.onclick = ()=> j('POST','/approval',{task_id:b.dataset.tid, event_id:b.dataset.eid, decision:b.dataset.d}).then(()=>{ loadAps(); loadTasks(); }).catch(()=>{ loadAps(); loadTasks(); });
+  });
+}
+// 群聊红点: 最后一条消息不是 human 发的才亮 (human 发完话即灭, codex/dsh 新口径)
+function updateChatDot(){
+  const lit = latestFrom && latestFrom !== 'human';
+  document.getElementById('chatdot').classList.toggle('hidden', !lit);
+}
+function updateProgDot(){
+  document.getElementById('progdot').classList.toggle('hidden', !progDirty);
+}
+function updatePend(){
+  // 进度红点: 自上次打开进度页后出现新的任务状态变化才亮, 进入进度页即清 (codex 1976 口径)
+  const pend = apList.length + needTaskCount;
+  document.getElementById('needcount').textContent = pend;
+  document.getElementById('needsec').classList.toggle('hidden', pend===0);
+  updateProgDot();
+}
+function toggleHist(){ const l=document.getElementById('histlist'); l.classList.toggle('hidden'); document.getElementById('histarrow').textContent = l.classList.contains('hidden') ? '▸' : '▾'; }
+function toggleSys(){ const l=document.getElementById('syslist'); l.classList.toggle('hidden'); document.getElementById('sysarrow').textContent = l.classList.contains('hidden') ? '▸' : '▾'; }
 async function loadTasks(){
   const d = await j('GET','/ui/tasks');
-  const tb = document.querySelector('#tasklist tbody'); tb.innerHTML='';
-  for (const t of d.tasks){
-    const tr = document.createElement('tr');
-    tr.innerHTML = '<td>'+esc(t.task_id).slice(0,8)+'</td><td><span class="pill '+esc(t.status)+'">'+esc(t.status)+'</span></td><td>'+esc(t.from)+'</td><td>'+esc(t.request).slice(0,80)+'</td><td>'+esc(tcn(t.updated_at))+'</td>';
-    tb.appendChild(tr);
-  }
+  const need = d.tasks.filter(t=>t.status==='needs_human' || t.status==='waiting_approval');
+  const prog = d.tasks.filter(t=>t.status==='queued' || t.status==='running');
+  const block = d.tasks.filter(t=>t.status==='waiting_input' || t.status==='failed');
+  needTaskCount = d.tasks.filter(t=>t.status==='needs_human').length;
+  const nl = document.getElementById('needlist');
+  nl.innerHTML = (apList.length ? apList.map(apCard).join('') : '') + need.map(taskCard).join('')
+    || '<div class="muted">暂无需要你处理的事</div>';
+  bindApButtons(nl);
+  bindTaskButtons(nl);
+  const render = (id, list)=>{ const el=document.getElementById(id); el.innerHTML = list.length ? list.map(taskCard).join('') : '<div class="muted">暂无</div>'; bindTaskButtons(el); };
+  render('proglist', prog);
+  render('blocklist', block);
+  render('histlist', d.history);
+  document.getElementById('blocksec').classList.toggle('hidden', block.length===0);
+  document.getElementById('histcount').textContent = d.history.length + ' 条 · 近48小时';
+  document.getElementById('syscount').textContent = '共 ' + d.sys_total + ' 条' + (d.sys_active ? ' · 活跃 ' + d.sys_active : '');
+  const f = d.tasks.map(t=>t.task_id+':'+t.status+':'+t.updated_at).join('|');
+  if (taskFp !== null && f !== taskFp && pane !== 'prog') progDirty = true;
+  taskFp = f;
+  updatePend();
 }
 async function loadAps(){
   const d = await j('GET','/ui/approvals');
-  const box = document.getElementById('aplist');
-  if (!d.approvals.length){ box.textContent='暂无待审批项'; return; }
-  box.innerHTML='';
-  for (const a of d.approvals){
-    const div = document.createElement('div'); div.className='card';
-    div.innerHTML = '<b>'+esc(a.op_summary)+'</b><div style="font-size:13px;color:#6b7280">task '+esc(a.task_id).slice(0,8)+' · 风险 '+esc(a.risk_level)+' · 截止 '+esc(tcn(a.expires_at))+'</div><div class="row"><button class="act ok" data-eid="'+esc(a.event_id)+'" data-tid="'+esc(a.task_id)+'" data-d="approve">批准</button><button class="act no" data-eid="'+esc(a.event_id)+'" data-tid="'+esc(a.task_id)+'" data-d="reject">拒绝</button></div>';
-    box.appendChild(div);
+  apList = d.approvals;
+  const pb = document.getElementById('pendbar');
+  if (!apList.length){ pb.classList.add('hidden'); pb.innerHTML=''; }
+  else {
+    pb.classList.remove('hidden');
+    pb.innerHTML = '<div class="ptitle">⚠️ 有 '+apList.length+' 项需要你批准</div>' +
+      apList.map(apCard).join('') +
+      '<div style="margin-top:6px;font-size:12px"><span class="alink" id="go-prog">去进度页处理 ▸</span></div>';
+    document.getElementById('go-prog').onclick = ()=> sw('prog');
+    bindApButtons(pb);
   }
-  box.querySelectorAll('button[data-eid]').forEach(b=>{
-    b.onclick = ()=> j('POST','/approval',{task_id:b.dataset.tid, event_id:b.dataset.eid, decision:b.dataset.d}).then(loadAps).catch(()=>loadAps());
-  });
+  const f = apList.map(a=>a.event_id).join('|');
+  if (apFp0 !== null && f !== apFp0 && pane !== 'prog') progDirty = true;
+  apFp0 = f;
+  updatePend();
 }
 document.getElementById('tab-chat').onclick=()=>{sw('chat')};
-document.getElementById('tab-task').onclick=()=>{sw('task')};
-document.getElementById('tab-ap').onclick=()=>{sw('ap')};
+document.getElementById('tab-prog').onclick=()=>{sw('prog')};
 function sw(t){
+  pane = t;
   document.getElementById('pane-chat').classList.toggle('hidden', t!=='chat');
-  document.getElementById('pane-task').classList.toggle('hidden', t!=='task');
-  document.getElementById('pane-ap').classList.toggle('hidden', t!=='ap');
-  for (const x of ['chat','task','ap']) document.getElementById('tab-'+x).classList.toggle('on', t===x);
+  document.getElementById('pane-prog').classList.toggle('hidden', t!=='prog');
+  for (const x of ['chat','prog']) document.getElementById('tab-'+x).classList.toggle('on', t===x);
+  if (t==='prog'){ progDirty = false; updateProgDot(); loadTasks().catch(()=>{}); loadAps().catch(()=>{}); }
 }
 document.getElementById('roomsel').onchange = ()=>{ room = document.getElementById('roomsel').value; loadFolds(); loadMsgs(true); };
 document.getElementById('inbox').addEventListener('keydown', e=>{ if(e.key==='Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendMsg(); } });

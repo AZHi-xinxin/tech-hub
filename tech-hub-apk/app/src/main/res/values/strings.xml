@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">tech-hub</string>
+    <string name="status_waiting">等待配置</string>
+    <string name="status_connecting">正在连接…</string>
+    <string name="status_connected">已连接</string>
+    <string name="status_offline">连接暂不可用</string>
+    <string name="polling_channel_name">tech-hub 后台门铃</string>
+    <string name="unread_channel_name">tech-hub 新消息</string>
+</resources>
+
